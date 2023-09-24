@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, Write},
+    io::{self, Read, Seek, Write},
     os::unix::prelude::OsStrExt,
     path::{Path, PathBuf},
     time::SystemTime,
@@ -13,7 +13,7 @@ pub mod flags;
 const MAGIC: u32 = 0x2f_96_8b_6a;
 
 #[repr(C)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 struct Metadata {
     modified_at: u64,
     file_size: u64,
@@ -33,6 +33,17 @@ impl Metadata {
             Ok(())
         } else {
             Err(())
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        let file_flag = self.flags & 3;
+        match file_flag {
+            0 => "File",
+            1 => "Directory",
+            2 => "Soft Link",
+            3 => "Hard Link",
+            _ => unreachable!(),
         }
     }
 
@@ -192,4 +203,65 @@ pub fn recursive_archive(archive: &mut impl Write, path: &Path) -> io::Result<()
     }
 
     Ok(())
+}
+
+enum DecodeError {
+    /// no further entries
+    Exhausted,
+    /// Generic Header Error
+    Header,
+    /// Generic Footer Error
+    Footer,
+    /// Faulty checksum
+    Checksum,
+    /// Cut off mid-file
+    Crop,
+}
+
+fn read_meta<R: Read + Seek>(name: &str, archive: &mut R) -> Result<Metadata, DecodeError> {
+    let mut bytes = [0u8; std::mem::size_of::<Metadata>()];
+    archive.read_exact(&mut bytes).map_err(|e| {
+        log::error!("Failed to decode {name}: {e:?}");
+        DecodeError::Exhausted
+    })?;
+
+    let mut meta: Metadata = unsafe { std::mem::transmute(bytes) };
+    meta.check().map_err(|e| {
+        log::error!("{name} check failed: {e:?}");
+        DecodeError::Header
+    })?;
+
+    Ok(meta)
+}
+
+fn read1<R: Read + Seek>(archive: &mut R) -> Result<(), DecodeError> {
+    let header = read_meta("Header", archive)?;
+    log::trace!("{header:?}");
+
+    let mut path = vec![0u8; header.path_len as usize];
+    archive.read_exact(&mut path).map_err(|e| {
+        log::error!("Failed to read path: {e:?}");
+        DecodeError::Crop
+    })?;
+    let path = String::from_utf8_lossy(&path);
+
+    archive
+        .seek(io::SeekFrom::Current(header.file_size as _))
+        .map_err(|e| {
+            log::error!("Failed to seek past file contents: {e:?}");
+            DecodeError::Crop
+        })?;
+
+    let footer = read_meta("Footer", archive)?;
+
+    log::info!(
+        "{kind: <9} : {path} : {size}B",
+        kind = header.kind(),
+        size = header.file_size
+    );
+
+    Ok(())
+}
+pub fn read<R: Read + Seek>(archive: &mut R) {
+    while let Ok(..) = read1(archive) {}
 }
